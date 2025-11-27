@@ -1,0 +1,44 @@
+# Python缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 配置文件（包含密码）
+config.py
+
+# 下载的数据文件
+*.json
+*.csv
+*.txt
+*.xlsx
+*.xls
+satcat_data_*.json
+tle_*.json
+gp_*.json
+fengyun1c_*.json
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE配置
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+.DS_Store
+
+# 数据库文件
+*.db
+*.sqlite
+*.sqlite3
+
