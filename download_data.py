@@ -45,8 +45,23 @@ def print_header(title, step, total):
     print("="*70)
 
 def save_json(data, filename):
+    """保存 JSON 数据，包含格式验证"""
+    # 验证数据格式
+    if not isinstance(data, list):
+        raise ValueError(f"期望 JSON 数组，收到 {type(data).__name__}")
+    
+    if len(data) == 0:
+        raise ValueError("JSON 数组为空，可能是 API 错误")
+    
+    # 采样检查第一条记录的数据有效性
+    first_record = data[0]
+    if not isinstance(first_record, dict):
+        raise ValueError(f"期望 JSON 对象，收到 {type(first_record).__name__}")
+    
+    # 保存文件
     with open(filename, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
+    
     size_mb = os.path.getsize(filename) / 1024 / 1024
     return size_mb
 
@@ -92,16 +107,27 @@ def download_satcat(session):
         response = session.get(url, timeout=180) # 增加超时时间
         
         if response.status_code == 200:
-            data = response.json()
-            filename = "data_satcat.json"
-            size_mb = save_json(data, filename)
-            duration = time.time() - start_time
-            
-            print(f"✅ 下载成功！({duration:.1f}秒)")
-            print(f"   📊 记录总数: {len(data):,}")
-            print(f"   💾 文件大小: {size_mb:.2f} MB")
-            print(f"   📁 已保存至: {filename}")
-            return True
+            try:
+                data = response.json()
+                filename = "data_satcat.json"
+                size_mb = save_json(data, filename)
+                duration = time.time() - start_time
+                
+                print(f"✅ 下载成功！({duration:.1f}秒)")
+                print(f"   📊 记录总数: {len(data):,}")
+                print(f"   💾 文件大小: {size_mb:.2f} MB")
+                print(f"   📁 已保存至: {filename}")
+                
+                # 保存元数据（下载时间戳）
+                metadata = {'download_time': datetime.now().isoformat(), 'record_count': len(data)}
+                with open(f"{filename}.metadata", 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                return True
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"❌ 数据格式错误: {e}")
+                print(f"   服务器响应: {response.text[:500]}")
+                return False
         else:
             print(f"❌ 下载失败！状态码: {response.status_code}")
             print(f"   信息: {response.text[:200]}")
@@ -122,21 +148,39 @@ def download_active_gp(session):
         response = session.get(url, timeout=180)
         
         if response.status_code == 200:
-            data = response.json()
-            filename = "data_active_gp.json"
-            size_mb = save_json(data, filename)
-            duration = time.time() - start_time
-            
-            print(f"✅ 下载成功！({duration:.1f}秒)")
-            print(f"   📊 记录总数: {len(data):,}")
-            print(f"   💾 文件大小: {size_mb:.2f} MB")
-            print(f"   📁 已保存至: {filename}")
-            
-            # 简单的数据质量检查
-            if len(data) < 10000:
-                print("   ⚠️ 警告: 下载的数据量似乎偏少 (<10000)，请检查API限制。")
-            
-            return True
+            try:
+                data = response.json()
+                filename = "data_active_gp.json"
+                size_mb = save_json(data, filename)
+                duration = time.time() - start_time
+                
+                print(f"✅ 下载成功！({duration:.1f}秒)")
+                print(f"   📊 记录总数: {len(data):,}")
+                print(f"   💾 文件大小: {size_mb:.2f} MB")
+                print(f"   📁 已保存至: {filename}")
+                
+                # 数据质量检查
+                if len(data) < 10000:
+                    print("   ⚠️ 警告: 下载的数据量偏少 (<10000)，可能未达到 API 限制")
+                elif len(data) >= 30000:
+                    print("   ⚠️ 警告: 数据量达到 API 限制 (30000)，可能存在截断")
+                
+                # 采样验证数据有效性
+                if data and 'NORAD_CAT_ID' in data[0]:
+                    print(f"   ✅ 数据格式验证通过（含 NORAD_CAT_ID）")
+                else:
+                    print(f"   ⚠️ 警告: 数据可能格式异常")
+                
+                # 保存元数据
+                metadata = {'download_time': datetime.now().isoformat(), 'record_count': len(data)}
+                with open(f"{filename}.metadata", 'w') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                return True
+            except (json.JSONDecodeError, ValueError) as e:
+                print(f"❌ 数据格式错误: {e}")
+                print(f"   服务器响应: {response.text[:500]}")
+                return False
         else:
             print(f"❌ 下载失败！状态码: {response.status_code}")
             return False
@@ -164,14 +208,30 @@ def download_debris_data(session):
             print(f"📡 请求中... (搜索 '{name}' 相关碎片)")
             response = session.get(url, timeout=60)
             if response.status_code == 200:
-                data = response.json()
-                size_mb = save_json(data, filename)
-                debris_count = len([d for d in data if 'DEB' in d.get('OBJECT_NAME', '')])
-                
-                print(f"✅ 下载成功！")
-                print(f"   🧩 碎片数量: {debris_count}")
-                print(f"   📁 已保存至: {filename}")
-                success_count += 1
+                try:
+                    data = response.json()
+                    size_mb = save_json(data, filename)
+                    debris_count = len([d for d in data if 'DEB' in d.get('OBJECT_NAME', '')])
+                    
+                    print(f"✅ 下载成功！")
+                    print(f"   🧩 碎片数量: {debris_count}")
+                    print(f"   📊 总记录数: {len(data)}")
+                    print(f"   💾 文件大小: {size_mb:.2f} MB")
+                    print(f"   📁 已保存至: {filename}")
+                    
+                    # 保存元数据
+                    metadata = {
+                        'download_time': datetime.now().isoformat(),
+                        'record_count': len(data),
+                        'debris_count': debris_count,
+                        'event_name': name
+                    }
+                    with open(f"{filename}.metadata", 'w') as f:
+                        json.dump(metadata, f, indent=2)
+                    
+                    success_count += 1
+                except (json.JSONDecodeError, ValueError) as e:
+                    print(f"❌ 数据格式错误: {e}")
             else:
                 print(f"❌ 下载失败！状态码: {response.status_code}")
         except Exception as e:

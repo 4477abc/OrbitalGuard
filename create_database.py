@@ -59,11 +59,12 @@ DATA_FILES = {
 }
 
 # 分层中位数填充策略（基于数据分析）
+# 注意：所有 key 必须为大写，与规范化后的数据库值一致
 LIFETIME_MEDIAN = {
     'LEO': 4.0,
     'MEO': 10.0,
     'GEO': 15.0,
-    'Elliptical': 7.0
+    'ELLIPTICAL': 7.0
 }
 
 # ============================================================
@@ -76,22 +77,53 @@ def print_header(title):
     print("="*70)
 
 def safe_float(value):
-    """安全转换为浮点数，失败返回 None"""
+    """安全转换为浮点数，失败返回 None
+    
+    支持：
+    - 整数和浮点数
+    - 科学计数法（如 1.2e-4）
+    - 字符串表示
+    """
+    if value is None or value in ['', 'N/A']:
+        return None
     try:
-        return float(value) if value not in [None, '', 'N/A'] else None
-    except (ValueError, TypeError):
+        f = float(value)
+        # 检查是否为有效的浮点数（排除 NaN 和 Inf）
+        return f if not (f != f or f == float('inf') or f == float('-inf')) else None
+    except (ValueError, TypeError, OverflowError):
         return None
 
 def safe_date(value):
-    """安全转换日期，支持多种格式"""
-    if not value or value in ['', 'N/A', None]:
+    """安全转换日期，支持多种格式
+    
+    支持：
+    - ISO 8601 格式 YYYY-MM-DD
+    - 长格式字符串（自动取前 10 字符）
+    - 日期有效性验证
+    """
+    import re
+    
+    if value is None or value in ['', 'N/A']:
         return None
+    
     try:
-        # Space-Track 日期格式通常是 YYYY-MM-DD
-        if isinstance(value, str) and len(value) >= 10:
-            return value[:10]  # 取前10个字符
-        return value
-    except:
+        # 转为字符串并取前 10 个字符
+        date_str = str(value)[:10] if value else None
+        
+        # 验证 YYYY-MM-DD 格式
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+            return None
+        
+        # 进一步验证日期的合理性
+        year, month, day = map(int, date_str.split('-'))
+        if month < 1 or month > 12 or day < 1 or day > 31:
+            return None
+        
+        # 对于 DECAY_DATE，允许未来日期；对于 LAUNCH_DATE，应该是过去日期
+        # 这里暂不做时间方向检查，保留为 NULL
+        
+        return date_str
+    except (ValueError, AttributeError, TypeError):
         return None
 
 def safe_upper(value):
@@ -248,6 +280,8 @@ def import_orbits(conn):
     
     cursor = conn.cursor()
     imported = 0
+    skipped_fk = 0  # 外键约束失败
+    skipped_invalid = 0  # 数据无效
     
     # 合并所有 GP 数据
     all_gp_data = []
@@ -255,14 +289,27 @@ def import_orbits(conn):
     for key in ['active_gp', 'fengyun1c', 'cosmos2251', 'iridium33']:
         filename = DATA_FILES[key]
         print(f"📖 读取: {filename}")
-        with open(filename, 'r') as f:
-            data = json.load(f)
-            all_gp_data.extend(data)
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+                # 验证数据格式（应为列表）
+                if not isinstance(data, list):
+                    print(f"   ⚠️  警告: {filename} 不是列表格式，跳过")
+                    continue
+                all_gp_data.extend(data)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"   ❌ 读取失败: {e}")
+            continue
     
     print(f"📊 总 GP 记录数: {len(all_gp_data):,}")
     
     for record in all_gp_data:
         try:
+            # 必要字段检查
+            if not record.get('NORAD_CAT_ID') or not record.get('EPOCH'):
+                skipped_invalid += 1
+                continue
+            
             cursor.execute("""
                 INSERT INTO Orbits 
                 (norad_id, epoch, inclination_deg, eccentricity, mean_motion,
@@ -280,12 +327,22 @@ def import_orbits(conn):
                 safe_float(record.get('BSTAR'))
             ))
             imported += 1
+        except sqlite3.IntegrityError as e:
+            # 外键约束失败或唯一性约束失败
+            if 'FOREIGN KEY constraint failed' in str(e):
+                skipped_fk += 1
+            else:
+                skipped_invalid += 1
         except Exception as e:
-            # 可能因为外键约束失败（NORAD_ID 不在 SpaceObjects 中）
-            pass
+            # 其他数据错误
+            skipped_invalid += 1
     
     conn.commit()
     print(f"✅ 导入 {imported:,} 条 Orbits 记录")
+    if skipped_fk > 0:
+        print(f"   ⚠️  跳过 {skipped_fk} 条（外键约束失败）")
+    if skipped_invalid > 0:
+        print(f"   ⚠️  跳过 {skipped_invalid} 条（数据无效）")
 
 # ============================================================
 # 4. 导入 SatelliteDetails (UCS + 分层填充)
@@ -311,8 +368,27 @@ def import_satellite_details(conn):
         'Country of Operator/Owner': 'country_operator'
     }
     
+    # 智能列名匹配：如果硬编码列名不存在，尝试模糊匹配
+    actual_col_map = {}
+    for expected_col, db_col in col_map.items():
+        if expected_col in df.columns:
+            actual_col_map[expected_col] = db_col
+        else:
+            # 尝试模糊匹配（去除非字母数字字符）
+            import re
+            pattern = re.sub(r'[^a-z0-9]', '', expected_col.lower())
+            
+            for actual_col in df.columns:
+                actual_pattern = re.sub(r'[^a-z0-9]', '', actual_col.lower())
+                if pattern == actual_pattern:
+                    actual_col_map[actual_col] = db_col
+                    print(f"   ℹ️  列名匹配: '{expected_col}' -> '{actual_col}'")
+                    break
+            else:
+                print(f"   ⚠️  警告: 未找到列 '{expected_col}'，会跳过该字段")
+    
     # 重命名列
-    df_clean = df.rename(columns=col_map)
+    df_clean = df.rename(columns=actual_col_map)
     
     # 分层中位数填充 Expected Lifetime
     print("🔧 应用分层中位数填充策略...")
@@ -399,6 +475,45 @@ def generate_launch_missions(conn):
 # 6. 数据验证与统计
 # ============================================================
 
+def precheck_data_files():
+    """导入前检查：验证所有数据文件的完整性和格式"""
+    print_header("数据文件预检查")
+    
+    all_ok = True
+    
+    for file_key, filepath in DATA_FILES.items():
+        if not os.path.exists(filepath):
+            print(f"❌ {filepath}: 文件不存在")
+            all_ok = False
+            continue
+        
+        try:
+            if filepath.endswith('.json'):
+                with open(filepath, 'r') as f:
+                    data = json.load(f)
+                    if not isinstance(data, list):
+                        print(f"⚠️  {filepath}: 不是 JSON 数组格式")
+                        all_ok = False
+                    else:
+                        print(f"✅ {filepath}: {len(data):,} 条记录")
+            elif filepath.endswith('.xlsx'):
+                df = pd.read_excel(filepath)
+                print(f"✅ {filepath}: {len(df):,} 行 × {len(df.columns)} 列")
+        except json.JSONDecodeError as e:
+            print(f"❌ {filepath}: JSON 解析失败 - {e}")
+            all_ok = False
+        except Exception as e:
+            print(f"❌ {filepath}: {type(e).__name__} - {e}")
+            all_ok = False
+    
+    if all_ok:
+        print("\n✅ 所有数据文件预检查通过")
+    else:
+        print("\n❌ 数据文件预检查失败，请修正问题后重试")
+        return False
+    
+    return True
+
 def validate_database(conn):
     print_header("数据库验证与统计")
     
@@ -468,6 +583,33 @@ def validate_database(conn):
         "SELECT DISTINCT class_of_orbit FROM SatelliteDetails WHERE class_of_orbit IS NOT NULL ORDER BY class_of_orbit"
     ).fetchall()
     print(f"   独特的轨道类型: {[o[0] for o in orbits]}")
+    
+    # 孤立记录检查
+    print("\n🔗 孤立记录检查:")
+    
+    # 检查 Orbits 中是否有 SpaceObjects 中不存在的 NORAD_ID
+    orphan_orbits = cursor.execute("""
+        SELECT COUNT(DISTINCT o.norad_id) FROM Orbits o
+        LEFT JOIN SpaceObjects s ON o.norad_id = s.norad_id
+        WHERE s.norad_id IS NULL
+    """).fetchone()[0]
+    
+    if orphan_orbits == 0:
+        print(f"   ✅ Orbits: 无孤立记录")
+    else:
+        print(f"   ⚠️  Orbits: 发现 {orphan_orbits} 个孤立 NORAD_ID")
+    
+    # 检查 SatelliteDetails 中是否有 SpaceObjects 中不存在的 NORAD_ID
+    orphan_details = cursor.execute("""
+        SELECT COUNT(*) FROM SatelliteDetails sd
+        LEFT JOIN SpaceObjects s ON sd.norad_id = s.norad_id
+        WHERE s.norad_id IS NULL
+    """).fetchone()[0]
+    
+    if orphan_details == 0:
+        print(f"   ✅ SatelliteDetails: 无孤立记录")
+    else:
+        print(f"   ⚠️  SatelliteDetails: 发现 {orphan_details} 个孤立记录")
 
 # ============================================================
 # 主函数
@@ -479,15 +621,9 @@ def main():
     print("="*70)
     print(f"📅 执行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # 检查数据文件
-    print("\n📋 检查数据文件...")
-    for name, filepath in DATA_FILES.items():
-        if os.path.exists(filepath):
-            size_mb = os.path.getsize(filepath) / 1024 / 1024
-            print(f"   ✅ {filepath:30s} ({size_mb:.2f} MB)")
-        else:
-            print(f"   ❌ {filepath:30s} (缺失!)")
-            return
+    # 数据文件预检查
+    if not precheck_data_files():
+        return
     
     # 删除旧数据库（如果存在）
     if os.path.exists(DB_NAME):
