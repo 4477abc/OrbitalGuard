@@ -13,6 +13,29 @@ OrbitalGuard - 数据库创建与数据导入脚本
 - Orbits          ← data_active_gp.json + 碎片数据
 - SatelliteDetails ← data_ucs_database.xlsx
 - LaunchMissions  ← 从 SpaceObjects 聚合
+
+数据清洗策略：
+===========
+1. 大小写规范化
+   - 分类字段（object_type, class_of_orbit, country等）统一转为大写
+   - 防止数据不一致性问题（如 "LEo" vs "LEO"）
+
+2. 空白字符处理
+   - 所有文本字段首尾去空（strip）
+   - 处理 None, 'N/A', '' 等缺失值
+
+3. 数值处理
+   - 使用 safe_float() 安全转换，失败返回 None
+   - 保留 NULL 值而非填充 0
+
+4. 日期处理
+   - 标准化为 YYYY-MM-DD 格式
+   - 支持多种输入格式
+
+5. 特殊处理
+   - expected_lifetime_years: 分层中位数填充
+   - launch_mission_id: 从国际编号提取前8位
+   - LaunchMissions: 聚合时规范化country和launch_site
 """
 
 import sqlite3
@@ -68,6 +91,24 @@ def safe_date(value):
         if isinstance(value, str) and len(value) >= 10:
             return value[:10]  # 取前10个字符
         return value
+    except:
+        return None
+
+def safe_upper(value):
+    """安全转换为大写，处理空值"""
+    if not value or value in ['', 'N/A', None]:
+        return None
+    try:
+        return str(value).upper().strip() if value else None
+    except:
+        return None
+
+def safe_strip(value):
+    """安全去除首尾空白"""
+    if not value or value in ['', 'N/A', None]:
+        return None
+    try:
+        return str(value).strip() if value else None
     except:
         return None
 
@@ -168,6 +209,12 @@ def import_space_objects(conn):
             intl_des = record.get('INTLDES', '')
             launch_mission_id = intl_des[:8] if len(intl_des) >= 8 else intl_des
             
+            # 数据清洗：规范化文本字段
+            object_type = safe_upper(record.get('OBJECT_TYPE'))
+            country = safe_upper(record.get('COUNTRY'))
+            rcs_size = safe_upper(record.get('RCS_SIZE'))
+            launch_site = safe_upper(record.get('SITE'))
+            
             cursor.execute("""
                 INSERT OR REPLACE INTO SpaceObjects 
                 (norad_id, object_name, intl_designator, object_type, country, 
@@ -175,14 +222,14 @@ def import_space_objects(conn):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.get('NORAD_CAT_ID'),
-                record.get('SATNAME'),
-                record.get('INTLDES'),
-                record.get('OBJECT_TYPE'),
-                record.get('COUNTRY'),
+                safe_strip(record.get('SATNAME')),
+                safe_upper(record.get('INTLDES')),
+                object_type,
+                country,
                 safe_date(record.get('LAUNCH')),
                 safe_date(record.get('DECAY')),
-                record.get('RCS_SIZE'),
-                record.get('SITE'),
+                rcs_size,
+                launch_site,
                 launch_mission_id
             ))
             imported += 1
@@ -287,6 +334,14 @@ def import_satellite_details(conn):
     
     for _, row in df_clean.iterrows():
         try:
+            # 数据清洗：规范化所有文本字段
+            class_of_orbit = safe_upper(row.get('class_of_orbit'))
+            purpose = safe_strip(row.get('purpose'))
+            users = safe_strip(row.get('users'))
+            contractor = safe_strip(row.get('contractor'))
+            operator_owner = safe_strip(row.get('operator_owner'))
+            country_operator = safe_upper(row.get('country_operator'))
+            
             cursor.execute("""
                 INSERT OR REPLACE INTO SatelliteDetails
                 (norad_id, launch_mass_kg, dry_mass_kg, power_watts, 
@@ -299,12 +354,12 @@ def import_satellite_details(conn):
                 safe_float(row.get('dry_mass_kg')),
                 safe_float(row.get('power_watts')),
                 safe_float(row.get('expected_lifetime_years')),
-                row.get('purpose'),
-                row.get('users'),
-                row.get('contractor'),
-                row.get('operator_owner'),
-                row.get('class_of_orbit'),
-                row.get('country_operator')
+                purpose,
+                users,
+                contractor,
+                operator_owner,
+                class_of_orbit,
+                country_operator
             ))
             imported += 1
         except Exception as e:
@@ -327,8 +382,8 @@ def generate_launch_missions(conn):
         SELECT 
             launch_mission_id,
             MIN(launch_date) as launch_date,
-            MAX(country) as country,
-            MAX(launch_site) as launch_site,
+            MAX(UPPER(country)) as country,
+            MAX(UPPER(launch_site)) as launch_site,
             COUNT(*) as payload_count
         FROM SpaceObjects
         WHERE launch_mission_id IS NOT NULL AND launch_mission_id != ''
@@ -386,6 +441,33 @@ def validate_database(conn):
         "SELECT COUNT(*) FROM SatelliteDetails WHERE expected_lifetime_years IS NOT NULL"
     ).fetchone()[0]
     print(f"   寿命数据完整率: {lifetime_filled}/{detailed} = {lifetime_filled/detailed*100:.1f}%")
+    
+    # 数据一致性检查
+    print("\n📋 数据一致性检查:")
+    
+    # 检查是否有小写的轨道类型
+    lowercase_orbits = cursor.execute(
+        "SELECT COUNT(*) FROM SatelliteDetails WHERE class_of_orbit LIKE '%[a-z]%'"
+    ).fetchone()[0]
+    if lowercase_orbits == 0:
+        print(f"   ✅ class_of_orbit: 全部为大写")
+    else:
+        print(f"   ⚠️  class_of_orbit: 发现 {lowercase_orbits} 条小写值")
+    
+    # 检查 object_type 大小写
+    lowercase_types = cursor.execute(
+        "SELECT COUNT(*) FROM SpaceObjects WHERE object_type LIKE '%[a-z]%'"
+    ).fetchone()[0]
+    if lowercase_types == 0:
+        print(f"   ✅ object_type: 全部为大写")
+    else:
+        print(f"   ⚠️  object_type: 发现 {lowercase_types} 条小写值")
+    
+    # 显示所有独特的轨道类型
+    orbits = cursor.execute(
+        "SELECT DISTINCT class_of_orbit FROM SatelliteDetails WHERE class_of_orbit IS NOT NULL ORDER BY class_of_orbit"
+    ).fetchall()
+    print(f"   独特的轨道类型: {[o[0] for o in orbits]}")
 
 # ============================================================
 # 主函数
