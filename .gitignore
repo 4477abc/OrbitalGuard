@@ -8,12 +8,15 @@ __pycache__/
 # 配置文件（包含密码）
 config.py
 
-# 下载的数据文件
-*.json
-*.csv
-*.txt
-*.xlsx
-*.xls
+# 下载的数据文件（已上传到仓库）
+# *.json
+# *.csv
+# *.txt
+# *.xlsx
+# *.xls
+
+# 元数据文件（下载辅助）
+*.metadata
 satcat_data_*.json
 tle_*.json
 gp_*.json
